@@ -3,7 +3,7 @@ import json
 import urllib.request
 import xml.etree.ElementTree as ET
 
-RSS_URL = "https://rss.app/r/feed/89eTgfMGhMoy1irn"
+RSS_URL =  "https://rss.app/feeds/89eTgfMGhMoy1irn.xml"
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK"]
 STATE_FILE = "last_seen.txt"
 
