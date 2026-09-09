@@ -1,9 +1,10 @@
 import os
 import json
 import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 
-RSS_URL =  "https://rss.app/feeds/tMndJxDlHKO3z40g.xml"
+RSS_URL = "https://rss.app/feeds/tMndJxDlHKO3z40g.xml"
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK"]
 STATE_FILE = "last_seen.txt"
 
@@ -113,14 +114,16 @@ def send_discord(item):
         method="POST"
     )
 
-try:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        print("Discord送信:", response.status)
-except urllib.error.HTTPError as e:
-    print("Discord送信エラー:", e.code)
-    print("Discordからの返答:")
-    print(e.read().decode("utf-8", errors="replace"))
-    raise
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            print("Discord送信:", response.status)
+
+    except urllib.error.HTTPError as e:
+        print("Discord送信エラー:", e.code)
+        print("Discordからの返答:")
+        print(e.read().decode("utf-8", errors="replace"))
+        raise
+
 
 def main():
     data = fetch_rss()
