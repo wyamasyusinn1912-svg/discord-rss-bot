@@ -6,7 +6,6 @@ import xml.etree.ElementTree as ET
 
 RSS_URL = "https://rss.app/feeds/tMndJxDlHKO3z40g.xml"
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK"]
-STATE_FILE = "last_seen.txt"
 
 
 def fetch_rss():
@@ -18,20 +17,39 @@ def fetch_rss():
         }
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        data = response.read()
+    print("RSS取得を開始します。")
 
-        print("RSS取得成功")
-        print("HTTP:", response.status)
-        print("Content-Type:", response.headers.get("Content-Type"))
-        print("データ先頭:", data[:500])
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = response.read()
 
-        return data
+            print("RSS取得成功")
+            print("HTTP:", response.status)
+            print("Content-Type:", response.headers.get("Content-Type"))
+            print("取得データサイズ:", len(data), "bytes")
+            print("データ先頭:", data[:500])
+
+            return data
+
+    except urllib.error.HTTPError as e:
+        print("RSS取得エラー")
+        print("HTTPステータス:", e.code)
+        print("レスポンス:")
+        print(e.read().decode("utf-8", errors="replace"))
+        raise
+
+    except urllib.error.URLError as e:
+        print("RSSへの接続自体に失敗しました。")
+        print("エラー内容:", e)
+        raise
 
 
 def get_items(data):
+    print("RSSのXML解析を開始します。")
+
     try:
         root = ET.fromstring(data)
+
     except ET.ParseError as e:
         print("RSSのXML解析に失敗しました。")
         print("受信したデータ:")
@@ -86,14 +104,23 @@ def get_items(data):
             "link": link
         })
 
+    print("RSS解析成功")
+    print("取得した記事数:", len(items))
+
     return items
 
 
-def send_discord(item):
-    message = f"🔔 **新着通知**\n\n**{item['title']}**"
+def send_discord_test(item):
+    print("")
+    print("========================================")
+    print("Discord送信テストを開始します。")
+    print("========================================")
 
-    if item["link"]:
-        message += f"\n\n🔗 {item['link']}"
+    # RSSから取得したタイトルだけを送信
+    message = f"🔔 Discord RSSテスト通知\n\n{item['title']}"
+
+    print("送信するメッセージ:")
+    print(message)
 
     payload = {
         "username": "非公式通知BOT",
@@ -109,64 +136,77 @@ def send_discord(item):
         WEBHOOK_URL,
         data=data,
         headers={
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
         },
         method="POST"
     )
 
+    print("")
+    print("Discord Webhookへ送信します。")
+
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            print("Discord送信:", response.status)
+            print("")
+            print("========================================")
+            print("Discord送信成功")
+            print("HTTPステータス:", response.status)
+            print("レスポンス:", response.read().decode("utf-8", errors="replace"))
+            print("========================================")
 
     except urllib.error.HTTPError as e:
-        print("Discord送信エラー:", e.code)
+        print("")
+        print("========================================")
+        print("Discord送信エラー")
+        print("HTTPステータス:", e.code)
+        print("レスポンスヘッダー:")
+        print(e.headers)
         print("Discordからの返答:")
         print(e.read().decode("utf-8", errors="replace"))
+        print("========================================")
+        raise
+
+    except urllib.error.URLError as e:
+        print("")
+        print("========================================")
+        print("Discordへの接続自体に失敗しました。")
+        print("エラー内容:", e)
+        print("========================================")
         raise
 
 
 def main():
+    print("========================================")
+    print("Discord RSS Bot 接続・送信テスト")
+    print("========================================")
+
+    # 1. RSS取得
     data = fetch_rss()
+
+    # 2. RSS解析
     items = get_items(data)
 
-    print("取得した記事数:", len(items))
-
     if not items:
+        print("")
         print("RSSに記事がありません。")
         return
 
+    # 3. 最新記事を確認
     latest = items[0]
 
-    old_id = ""
+    print("")
+    print("最新記事:")
+    print("タイトル:", latest["title"])
+    print("リンク:", latest["link"])
+    print("ID:", latest["id"])
 
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            old_id = f.read().strip()
+    # 4. Discordへ最新記事を1件だけ送信
+    send_discord_test(latest)
 
-    # 初回
-    if not old_id:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            f.write(latest["id"])
-
-        print("初回設定完了。既存記事は通知しません。")
-        return
-
-    new_items = []
-
-    for item in items:
-        if item["id"] == old_id:
-            break
-
-        new_items.append(item)
-
-    for item in reversed(new_items):
-        print("新着通知:", item["title"])
-        send_discord(item)
-
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        f.write(latest["id"])
-
-    print(f"{len(new_items)}件の新着を処理しました。")
+    print("")
+    print("========================================")
+    print("すべてのテストが完了しました。")
+    print("========================================")
 
 
 if __name__ == "__main__":
