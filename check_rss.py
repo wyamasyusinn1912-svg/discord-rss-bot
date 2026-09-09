@@ -113,9 +113,14 @@ def send_discord(item):
         method="POST"
     )
 
+try:
     with urllib.request.urlopen(request, timeout=30) as response:
         print("Discord送信:", response.status)
-
+except urllib.error.HTTPError as e:
+    print("Discord送信エラー:", e.code)
+    print("Discordからの返答:")
+    print(e.read().decode("utf-8", errors="replace"))
+    raise
 
 def main():
     data = fetch_rss()
