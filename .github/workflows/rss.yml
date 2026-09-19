@@ -14,14 +14,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.13"
 
-      - name: Check RSS and send Discord notification
+      - name: Check X and send Discord notification
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
@@ -32,5 +32,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add last_seen.txt
-          git diff --cached --quiet || git commit -m "Update RSS state"
+          git diff --cached --quiet || git commit -m "Update notification state"
           git push
