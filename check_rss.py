@@ -4,7 +4,7 @@ import json
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+import urllib.parse
 
 
 # ============================================================
@@ -13,27 +13,35 @@ from datetime import datetime, timezone
 
 USERNAME = "StarWard_JP"
 
-TIMELINE_URL = (
+# 第1取得先：X公開Syndication
+SYNDICATION_URL = (
     "https://syndication.twitter.com/"
     f"srv/timeline-profile/screen-name/{USERNAME}"
 )
 
-TWEET_RESULT_URL = "https://cdn.syndication.twimg.com/tweet-result"
+# 第2取得先：FxTwitter / FxEmbed
+FX_PROFILE_URL = (
+    "https://api.fxtwitter.com/2/profile/"
+    f"{USERNAME}/media"
+)
+
+# 個別投稿取得
+FX_STATUS_URL = (
+    "https://api.fxtwitter.com/2/status"
+)
 
 LAST_SEEN_FILE = "last_seen.txt"
 
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
+DISCORD_WEBHOOK = os.environ.get(
+    "DISCORD_WEBHOOK"
+)
 
 
 # ============================================================
-# HTTP取得
+# 共通HTTP取得
 # ============================================================
 
-def http_get(url, timeout=30, retries=3):
-    """
-    URLからデータを取得する。
-    429 / 5xx の場合は少し待ってリトライする。
-    """
+def http_get(url, timeout=30, retries=2):
 
     headers = {
         "User-Agent": (
@@ -51,6 +59,7 @@ def http_get(url, timeout=30, retries=3):
     for attempt in range(1, retries + 1):
 
         try:
+
             request = urllib.request.Request(
                 url,
                 headers=headers,
@@ -63,14 +72,14 @@ def http_get(url, timeout=30, retries=3):
             ) as response:
 
                 status = response.status
-                data = response.read()
+                body = response.read()
 
                 if status != 200:
                     raise RuntimeError(
                         f"HTTPステータス: {status}"
                     )
 
-                return data
+                return body
 
         except urllib.error.HTTPError as e:
 
@@ -81,18 +90,40 @@ def http_get(url, timeout=30, retries=3):
                 f"(試行 {attempt}/{retries})"
             )
 
-            # レート制限や一時的なサーバーエラーだけリトライ
-            if e.code in (429, 500, 502, 503, 504):
+            if e.code == 429:
 
+                print(
+                    "429 Too Many Requests "
+                    "→ この取得先は一時的に使用できません。"
+                )
+
+                # 429は長時間リトライしない
                 if attempt < retries:
-                    wait_time = attempt * 5
 
-                    print(
-                        f"{wait_time}秒待って再試行します。"
+                    time.sleep(
+                        10 * attempt
                     )
 
-                    time.sleep(wait_time)
                     continue
+
+                raise
+
+            if e.code in (
+                500,
+                502,
+                503,
+                504,
+            ):
+
+                if attempt < retries:
+
+                    time.sleep(
+                        5 * attempt
+                    )
+
+                    continue
+
+                raise
 
             raise
 
@@ -101,537 +132,755 @@ def http_get(url, timeout=30, retries=3):
             last_error = e
 
             print(
-                f"通信エラー: {e} "
-                f"(試行 {attempt}/{retries})"
+                f"通信エラー: {e}"
             )
 
             if attempt < retries:
-                wait_time = attempt * 3
 
-                print(
-                    f"{wait_time}秒待って再試行します。"
+                time.sleep(
+                    3 * attempt
                 )
 
-                time.sleep(wait_time)
+                continue
+
+            raise
 
     raise last_error
 
 
 # ============================================================
-# Xプロフィールタイムライン取得
+# JSON取得
 # ============================================================
 
-def fetch_timeline():
-    """
-    Xの公開Syndicationタイムラインを取得する。
-    """
+def http_get_json(url):
 
-    print("Xタイムライン取得を開始します。")
-    print(f"対象アカウント: @{USERNAME}")
-    print(f"URL: {TIMELINE_URL}")
+    data = http_get(
+        url,
+        timeout=30,
+        retries=2,
+    )
 
-    data = http_get(TIMELINE_URL)
+    return json.loads(
+        data.decode(
+            "utf-8",
+            errors="replace",
+        )
+    )
+
+
+# ============================================================
+# Syndicationから取得
+# ============================================================
+
+def fetch_syndication():
+
+    print("")
+    print("【取得方法1】X Syndication")
+    print(
+        f"URL: {SYNDICATION_URL}"
+    )
+
+    try:
+
+        data = http_get(
+            SYNDICATION_URL,
+            timeout=30,
+            retries=2,
+        )
+
+    except Exception as e:
+
+        print(
+            "Syndication取得失敗"
+        )
+
+        print(
+            f"理由: {e}"
+        )
+
+        return []
 
     html_text = data.decode(
         "utf-8",
         errors="replace",
     )
 
-    # __NEXT_DATA__ を探す
-    pattern = (
-        r'<script[^>]*id="__NEXT_DATA__"'
-        r'[^>]*>(.*?)</script>'
-    )
-
+    # __NEXT_DATA__を探す
     match = re.search(
-        pattern,
+        r'<script[^>]*id="__NEXT_DATA__"'
+        r'[^>]*>(.*?)</script>',
         html_text,
         re.DOTALL,
     )
 
     if not match:
-        raise RuntimeError(
-            "__NEXT_DATA__ が見つかりませんでした。"
+
+        print(
+            "__NEXT_DATA__ が見つかりません。"
         )
 
-    json_text = match.group(1)
-
-    try:
-        next_data = json.loads(json_text)
-
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"__NEXT_DATA__ のJSON解析に失敗しました: {e}"
-        )
-
-    print("Xタイムラインの取得に成功しました。")
-
-    return next_data
-
-
-# ============================================================
-# timeline.entries を探す
-# ============================================================
-
-def find_entries(obj):
-    """
-    JSONの中から timeline.entries を探す。
-    """
-
-    if isinstance(obj, dict):
-
-        timeline = obj.get("timeline")
-
-        if isinstance(timeline, dict):
-
-            entries = timeline.get("entries")
-
-            if isinstance(entries, list):
-                return entries
-
-        for value in obj.values():
-
-            result = find_entries(value)
-
-            if result is not None:
-                return result
-
-    elif isinstance(obj, list):
-
-        for item in obj:
-
-            result = find_entries(item)
-
-            if result is not None:
-                return result
-
-    return None
-
-
-# ============================================================
-# 投稿データ抽出
-# ============================================================
-
-def extract_tweet_from_entry(entry):
-    """
-    timeline entry からメインの投稿データを取得する。
-    """
-
-    if not isinstance(entry, dict):
-        return None
-
-    content = entry.get("content")
-
-    if not isinstance(content, dict):
-        return None
-
-    # --------------------------------------------------------
-    # 現在よく見られる形式
-    # content
-    #   -> itemContent
-    #       -> tweet_results
-    #           -> result
-    # --------------------------------------------------------
-
-    item_content = content.get("itemContent")
-
-    if isinstance(item_content, dict):
-
-        tweet_results = item_content.get(
-            "tweet_results"
-        )
-
-        if isinstance(tweet_results, dict):
-
-            result = tweet_results.get("result")
-
-            if isinstance(result, dict):
-
-                return result
-
-        # 古い形式
-        tweet = item_content.get("tweet")
-
-        if isinstance(tweet, dict):
-            return tweet
-
-    # --------------------------------------------------------
-    # 別形式への対応
-    # --------------------------------------------------------
-
-    tweet = content.get("tweet")
-
-    if isinstance(tweet, dict):
-        return tweet
-
-    return None
-
-
-# ============================================================
-# 投稿一覧を取得
-# ============================================================
-
-def find_tweets(next_data):
-    """
-    timeline.entries から投稿を抽出する。
-    """
-
-    entries = find_entries(next_data)
-
-    if not entries:
-        print("timeline.entries が見つかりませんでした。")
         return []
 
-    print(f"timeline.entries: {len(entries)}件")
+    try:
+
+        next_data = json.loads(
+            match.group(1)
+        )
+
+    except Exception as e:
+
+        print(
+            f"JSON解析失敗: {e}"
+        )
+
+        return []
+
+    entries = find_entries(
+        next_data
+    )
+
+    if not entries:
+
+        print(
+            "timeline.entries が見つかりません。"
+        )
+
+        return []
 
     tweets = []
 
     for entry in entries:
 
-        tweet = extract_tweet_from_entry(entry)
-
-        if not isinstance(tweet, dict):
-            continue
-
-        legacy = tweet.get("legacy")
-
-        # 新しい形式では legacy の中に本文などが入る
-        if isinstance(legacy, dict):
-
-            tweet_id = (
-                legacy.get("id_str")
-                or tweet.get("rest_id")
-                or tweet.get("id_str")
-            )
-
-            text = (
-                legacy.get("full_text")
-                or legacy.get("text")
-                or tweet.get("text")
-                or ""
-            )
-
-            user = legacy.get("user")
-
-            if not isinstance(user, dict):
-                user = {}
-
-            # author情報が別場所にある場合
-            if not user:
-
-                core = tweet.get("core")
-
-                if isinstance(core, dict):
-
-                    user_results = core.get(
-                        "user_results"
-                    )
-
-                    if isinstance(
-                        user_results,
-                        dict,
-                    ):
-
-                        user_result = user_results.get(
-                            "result"
-                        )
-
-                        if isinstance(
-                            user_result,
-                            dict,
-                        ):
-
-                            user = (
-                                user_result.get("legacy")
-                                or {}
-                            )
-
-            screen_name = (
-                user.get("screen_name")
-                or USERNAME
-            )
-
-            name = (
-                user.get("name")
-                or "星の翼【公式】"
-            )
-
-            created_at = (
-                legacy.get("created_at")
-                or ""
-            )
-
-            media = (
-                legacy.get("extended_entities", {})
-                if isinstance(
-                    legacy.get("extended_entities"),
-                    dict,
-                )
-                else {}
-            )
-
-            if not tweet_id or not text:
-                continue
-
-        else:
-
-            # 古い形式
-            tweet_id = (
-                tweet.get("id_str")
-                or tweet.get("id")
-                or tweet.get("rest_id")
-            )
-
-            text = (
-                tweet.get("full_text")
-                or tweet.get("text")
-                or ""
-            )
-
-            user = tweet.get("user")
-
-            if not isinstance(user, dict):
-                user = {}
-
-            screen_name = (
-                user.get("screen_name")
-                or USERNAME
-            )
-
-            name = (
-                user.get("name")
-                or "星の翼【公式】"
-            )
-
-            created_at = (
-                tweet.get("created_at")
-                or ""
-            )
-
-            media = (
-                tweet.get("extended_entities", {})
-                if isinstance(
-                    tweet.get("extended_entities"),
-                    dict,
-                )
-                else {}
-            )
-
-            if not tweet_id or not text:
-                continue
-
-        # 数字IDであることを確認
-        if not str(tweet_id).isdigit():
-            continue
-
-        permalink = (
-            f"https://x.com/{screen_name}/status/{tweet_id}"
+        tweet = extract_tweet(
+            entry
         )
 
-        tweets.append(
-            {
-                "id": str(tweet_id),
-                "text": text,
-                "screen_name": screen_name,
-                "name": name,
-                "created_at": created_at,
-                "permalink": permalink,
-                "raw_media": media,
-            }
-        )
+        if tweet:
 
-    # ID重複を除去
-    unique = {}
+            tweets.append(
+                tweet
+            )
 
-    for tweet in tweets:
-        unique[tweet["id"]] = tweet
-
-    tweets = list(unique.values())
-
-    # 新しい順
-    tweets.sort(
-        key=lambda x: int(x["id"]),
-        reverse=True,
+    tweets = unique_tweets(
+        tweets
     )
 
     print(
-        f"取得できた投稿数: {len(tweets)}件"
+        f"Syndication取得投稿数: "
+        f"{len(tweets)}"
     )
 
     return tweets
 
 
 # ============================================================
-# Tweet Result API
+# timeline.entries探索
 # ============================================================
 
-def fetch_tweet_detail(tweet_id):
-    """
-    投稿IDから詳細情報を取得する。
-    画像などの補完用。
-    """
+def find_entries(obj):
 
-    url = (
-        f"{TWEET_RESULT_URL}"
-        f"?id={tweet_id}"
-        f"&token=0"
+    if isinstance(obj, dict):
+
+        timeline = obj.get(
+            "timeline"
+        )
+
+        if isinstance(
+            timeline,
+            dict,
+        ):
+
+            entries = timeline.get(
+                "entries"
+            )
+
+            if isinstance(
+                entries,
+                list,
+            ):
+
+                return entries
+
+        for value in obj.values():
+
+            result = find_entries(
+                value
+            )
+
+            if result is not None:
+
+                return result
+
+    elif isinstance(obj, list):
+
+        for item in obj:
+
+            result = find_entries(
+                item
+            )
+
+            if result is not None:
+
+                return result
+
+    return None
+
+
+# ============================================================
+# Syndication投稿抽出
+# ============================================================
+
+def extract_tweet(entry):
+
+    if not isinstance(
+        entry,
+        dict,
+    ):
+        return None
+
+    content = entry.get(
+        "content"
+    )
+
+    if not isinstance(
+        content,
+        dict,
+    ):
+        return None
+
+    item_content = content.get(
+        "itemContent"
+    )
+
+    if not isinstance(
+        item_content,
+        dict,
+    ):
+        return None
+
+    tweet_results = (
+        item_content.get(
+            "tweet_results"
+        )
+    )
+
+    result = None
+
+    if isinstance(
+        tweet_results,
+        dict,
+    ):
+
+        result = tweet_results.get(
+            "result"
+        )
+
+    # 古い形式
+    if not isinstance(
+        result,
+        dict,
+    ):
+
+        result = item_content.get(
+            "tweet"
+        )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return None
+
+    legacy = result.get(
+        "legacy"
+    )
+
+    if isinstance(
+        legacy,
+        dict,
+    ):
+
+        tweet_id = (
+            legacy.get("id_str")
+            or result.get("rest_id")
+        )
+
+        text = (
+            legacy.get("full_text")
+            or legacy.get("text")
+            or ""
+        )
+
+        user = legacy.get(
+            "user"
+        )
+
+        if not isinstance(
+            user,
+            dict,
+        ):
+
+            user = {}
+
+        screen_name = (
+            user.get(
+                "screen_name"
+            )
+            or USERNAME
+        )
+
+        media_container = (
+            legacy.get(
+                "extended_entities"
+            )
+        )
+
+    else:
+
+        tweet_id = (
+            result.get("id_str")
+            or result.get("rest_id")
+            or result.get("id")
+        )
+
+        text = (
+            result.get("full_text")
+            or result.get("text")
+            or ""
+        )
+
+        user = result.get(
+            "user"
+        )
+
+        if not isinstance(
+            user,
+            dict,
+        ):
+
+            user = {}
+
+        screen_name = (
+            user.get(
+                "screen_name"
+            )
+            or USERNAME
+        )
+
+        media_container = (
+            result.get(
+                "extended_entities"
+            )
+        )
+
+    if not tweet_id:
+        return None
+
+    if not str(tweet_id).isdigit():
+        return None
+
+    if not text:
+        return None
+
+    permalink = (
+        f"https://x.com/"
+        f"{screen_name}/status/"
+        f"{tweet_id}"
+    )
+
+    media_urls = []
+
+    if isinstance(
+        media_container,
+        dict,
+    ):
+
+        media_list = (
+            media_container.get(
+                "media"
+            )
+        )
+
+        if isinstance(
+            media_list,
+            list,
+        ):
+
+            for media in media_list:
+
+                if not isinstance(
+                    media,
+                    dict,
+                ):
+                    continue
+
+                media_url = (
+                    media.get(
+                        "media_url_https"
+                    )
+                    or media.get(
+                        "media_url"
+                    )
+                )
+
+                if media_url:
+
+                    media_urls.append(
+                        media_url
+                    )
+
+    return {
+        "id": str(tweet_id),
+        "text": text,
+        "screen_name": screen_name,
+        "permalink": permalink,
+        "media_urls": media_urls[:4],
+    }
+
+
+# ============================================================
+# FxTwitterからメディア投稿を取得
+# ============================================================
+
+def fetch_fxtwitter_media():
+
+    print("")
+    print(
+        "【取得方法2】FxTwitter / FxEmbed"
+    )
+
+    print(
+        f"URL: {FX_PROFILE_URL}"
     )
 
     try:
 
-        data = http_get(
-            url,
-            timeout=20,
-            retries=2,
+        data = http_get_json(
+            FX_PROFILE_URL
         )
-
-        result = json.loads(
-            data.decode(
-                "utf-8",
-                errors="replace",
-            )
-        )
-
-        return result
 
     except Exception as e:
 
         print(
-            f"投稿詳細取得失敗: "
-            f"{tweet_id} / {e}"
+            "FxTwitter取得失敗"
         )
 
-        # 詳細取得失敗しても本文通知は続行
-        return None
+        print(
+            f"理由: {e}"
+        )
 
+        return []
 
-# ============================================================
-# メディアURL抽出
-# ============================================================
+    results = data.get(
+        "results"
+    )
 
-def extract_media_from_raw(raw_media):
-    """
-    timelineのraw_mediaから画像URLを取得する。
-    """
+    if not isinstance(
+        results,
+        list,
+    ):
 
-    urls = []
+        print(
+            "FxTwitterから投稿一覧を取得できませんでした。"
+        )
 
-    if not isinstance(raw_media, dict):
-        return urls
+        return []
 
-    media_list = raw_media.get("media")
+    tweets = []
 
-    if not isinstance(media_list, list):
-        return urls
+    for item in results:
 
-    for media in media_list:
-
-        if not isinstance(media, dict):
+        if not isinstance(
+            item,
+            dict,
+        ):
             continue
 
-        media_url = (
-            media.get("media_url_https")
-            or media.get("media_url")
+        tweet_id = item.get(
+            "id"
         )
 
-        if media_url:
-            urls.append(media_url)
+        text = item.get(
+            "text"
+        )
 
-    return urls
+        if not tweet_id:
+            continue
 
+        if not str(tweet_id).isdigit():
+            continue
 
-def extract_media_from_detail(detail):
-    """
-    tweet-resultの結果から画像URLを取得する。
-    """
+        if not text:
+            continue
 
-    urls = []
+        author = item.get(
+            "author"
+        )
 
-    if not isinstance(detail, dict):
-        return urls
+        if not isinstance(
+            author,
+            dict,
+        ):
 
-    # --------------------------------------------------------
-    # photos
-    # --------------------------------------------------------
+            author = {}
 
-    photos = detail.get("photos")
+        screen_name = (
+            author.get(
+                "screen_name"
+            )
+            or USERNAME
+        )
 
-    if isinstance(photos, list):
+        permalink = (
+            item.get(
+                "url"
+            )
+            or
+            f"https://x.com/"
+            f"{screen_name}/status/"
+            f"{tweet_id}"
+        )
 
-        for photo in photos:
+        media_urls = []
 
-            if not isinstance(photo, dict):
-                continue
+        media = item.get(
+            "media"
+        )
 
-            url = photo.get("url")
+        if isinstance(
+            media,
+            dict,
+        ):
 
-            if url:
-                urls.append(url)
+            all_media = []
 
-    # --------------------------------------------------------
-    # mediaDetails
-    # --------------------------------------------------------
+            for key in (
+                "all",
+                "photos",
+            ):
 
-    media_details = detail.get(
-        "mediaDetails"
+                value = media.get(
+                    key
+                )
+
+                if isinstance(
+                    value,
+                    list,
+                ):
+
+                    all_media.extend(
+                        value
+                    )
+
+            for media_item in all_media:
+
+                if not isinstance(
+                    media_item,
+                    dict,
+                ):
+                    continue
+
+                url = (
+                    media_item.get(
+                        "url"
+                    )
+                    or media_item.get(
+                        "thumbnail_url"
+                    )
+                )
+
+                if url:
+                    media_urls.append(
+                        url
+                    )
+
+        tweets.append(
+            {
+                "id": str(tweet_id),
+                "text": text,
+                "screen_name": screen_name,
+                "permalink": permalink,
+                "media_urls": media_urls[:4],
+            }
+        )
+
+    tweets = unique_tweets(
+        tweets
     )
 
-    if isinstance(media_details, list):
+    print(
+        f"FxTwitter取得投稿数: "
+        f"{len(tweets)}"
+    )
 
-        for media in media_details:
+    return tweets
 
-            if not isinstance(media, dict):
-                continue
 
-            media_url = (
-                media.get("media_url_https")
-                or media.get("media_url")
+# ============================================================
+# 投稿重複削除
+# ============================================================
+
+def unique_tweets(tweets):
+
+    result = {}
+
+    for tweet in tweets:
+
+        tweet_id = tweet.get(
+            "id"
+        )
+
+        if tweet_id:
+
+            result[tweet_id] = tweet
+
+    output = list(
+        result.values()
+    )
+
+    output.sort(
+        key=lambda x: int(
+            x["id"]
+        ),
+        reverse=True,
+    )
+
+    return output
+
+
+# ============================================================
+# 個別投稿情報取得
+# ============================================================
+
+def fetch_single_tweet(
+    tweet_id,
+):
+
+    url = (
+        f"{FX_STATUS_URL}/"
+        f"{USERNAME}/"
+        f"{tweet_id}"
+    )
+
+    try:
+
+        data = http_get_json(
+            url
+        )
+
+    except Exception as e:
+
+        print(
+            f"個別投稿取得失敗: "
+            f"{tweet_id}"
+        )
+
+        print(
+            f"理由: {e}"
+        )
+
+        return None
+
+    status = data.get(
+        "status"
+    )
+
+    if not isinstance(
+        status,
+        dict,
+    ):
+        return None
+
+    text = status.get(
+        "text"
+    )
+
+    if not text:
+        return None
+
+    author = status.get(
+        "author"
+    )
+
+    if not isinstance(
+        author,
+        dict,
+    ):
+
+        author = {}
+
+    screen_name = (
+        author.get(
+            "screen_name"
+        )
+        or USERNAME
+    )
+
+    permalink = (
+        status.get(
+            "url"
+        )
+        or
+        f"https://x.com/"
+        f"{screen_name}/status/"
+        f"{tweet_id}"
+    )
+
+    media_urls = []
+
+    media = status.get(
+        "media"
+    )
+
+    if isinstance(
+        media,
+        dict,
+    ):
+
+        for key in (
+            "all",
+            "photos",
+        ):
+
+            value = media.get(
+                key
             )
 
-            if media_url:
-                urls.append(media_url)
+            if isinstance(
+                value,
+                list,
+            ):
 
-    # 重複削除
-    result = []
+                for media_item in value:
 
-    for url in urls:
+                    if not isinstance(
+                        media_item,
+                        dict,
+                    ):
+                        continue
 
-        if url not in result:
-            result.append(url)
+                    url = (
+                        media_item.get(
+                            "url"
+                        )
+                        or media_item.get(
+                            "thumbnail_url"
+                        )
+                    )
 
-    return result
+                    if url:
 
+                        media_urls.append(
+                            url
+                        )
 
-def get_media_urls(tweet):
-    """
-    画像URLを取得する。
-    まずタイムラインデータ、
-    取れなければtweet-resultを使用。
-    """
-
-    # ① タイムラインから取得
-    urls = extract_media_from_raw(
-        tweet.get("raw_media")
-    )
-
-    if urls:
-        return urls[:4]
-
-    # ② tweet-resultから取得
-    detail = fetch_tweet_detail(
-        tweet["id"]
-    )
-
-    if detail:
-
-        urls = extract_media_from_detail(
-            detail
-        )
-
-        if urls:
-            return urls[:4]
-
-    return []
+    return {
+        "id": str(tweet_id),
+        "text": text,
+        "screen_name": screen_name,
+        "permalink": permalink,
+        "media_urls": media_urls[:4],
+    }
 
 
 # ============================================================
@@ -639,14 +888,15 @@ def get_media_urls(tweet):
 # ============================================================
 
 def load_last_seen():
-    """
-    last_seen.txtから最後に通知した投稿IDを取得。
-    """
 
-    if not os.path.exists(LAST_SEEN_FILE):
+    if not os.path.exists(
+        LAST_SEEN_FILE
+    ):
+
         print(
-            "last_seen.txt が存在しません。"
+            "last_seen.txt がありません。"
         )
+
         return ""
 
     try:
@@ -667,34 +917,29 @@ def load_last_seen():
 
         return ""
 
-    if not value:
-        return ""
-
-    # 数字だけの場合
     if value.isdigit():
+
         return value
 
-    # X URLの場合
     match = re.search(
         r"/status/(\d+)",
         value,
     )
 
     if match:
+
         return match.group(1)
 
-    # 古いRSSのGUIDなど
     print(
-        "last_seen.txt に有効な投稿IDがありません。"
+        "last_seen.txt の値がX投稿IDではありません。"
     )
 
     return ""
 
 
-def save_last_seen(tweet_id):
-    """
-    最後に処理した投稿IDを保存。
-    """
+def save_last_seen(
+    tweet_id,
+):
 
     with open(
         LAST_SEEN_FILE,
@@ -702,43 +947,33 @@ def save_last_seen(tweet_id):
         encoding="utf-8",
     ) as f:
 
-        f.write(str(tweet_id))
+        f.write(
+            str(tweet_id)
+        )
 
     print(
-        f"last_seen.txt を更新しました: {tweet_id}"
+        f"last_seen.txt更新: {tweet_id}"
     )
 
 
 # ============================================================
-# Discord通知
+# Discord送信
 # ============================================================
 
-def send_discord(tweet):
-    """
-    Discord Webhookへ投稿を送信。
-    """
+def send_discord(
+    tweet,
+):
 
     if not DISCORD_WEBHOOK:
+
         raise RuntimeError(
             "DISCORD_WEBHOOK が設定されていません。"
         )
 
-    text = tweet["text"]
-
-    permalink = tweet["permalink"]
-
-    print(
-        f"Discord通知送信: {tweet['id']}"
-    )
-
-    media_urls = get_media_urls(
-        tweet
-    )
-
     content = (
         "🔔 **星の翼【公式】 新着投稿**\n\n"
-        f"{text}\n\n"
-        f"🔗 {permalink}"
+        f"{tweet['text']}\n\n"
+        f"🔗 {tweet['permalink']}"
     )
 
     payload = {
@@ -749,12 +984,16 @@ def send_discord(tweet):
         },
     }
 
-    # 画像がある場合
+    media_urls = tweet.get(
+        "media_urls",
+        [],
+    )
+
     if media_urls:
 
         embeds = []
 
-        for index, media_url in enumerate(
+        for index, url in enumerate(
             media_urls[:4]
         ):
 
@@ -763,7 +1002,7 @@ def send_discord(tweet):
                 embeds.append(
                     {
                         "image": {
-                            "url": media_url
+                            "url": url
                         }
                     }
                 )
@@ -773,7 +1012,7 @@ def send_discord(tweet):
                 embeds.append(
                     {
                         "thumbnail": {
-                            "url": media_url
+                            "url": url
                         }
                     }
                 )
@@ -783,14 +1022,18 @@ def send_discord(tweet):
     data = json.dumps(
         payload,
         ensure_ascii=False,
-    ).encode("utf-8")
+    ).encode(
+        "utf-8"
+    )
 
     request = urllib.request.Request(
         DISCORD_WEBHOOK,
         data=data,
         headers={
-            "Content-Type": "application/json",
-            "User-Agent": "DiscordRSSBot/1.0",
+            "Content-Type":
+                "application/json",
+            "User-Agent":
+                "StarWardDiscordBot/1.0",
         },
         method="POST",
     )
@@ -802,12 +1045,14 @@ def send_discord(tweet):
             timeout=30,
         ) as response:
 
-            status = response.status
-
-            if status not in (200, 204):
+            if response.status not in (
+                200,
+                204,
+            ):
 
                 raise RuntimeError(
-                    f"Discord HTTPステータス: {status}"
+                    "Discord HTTP "
+                    f"{response.status}"
                 )
 
     except urllib.error.HTTPError as e:
@@ -818,8 +1063,8 @@ def send_discord(tweet):
         )
 
         raise RuntimeError(
-            f"Discord通知エラー: "
-            f"HTTP {e.code} / {body}"
+            f"Discord通知失敗 "
+            f"HTTP {e.code}: {body}"
         )
 
     print(
@@ -828,14 +1073,14 @@ def send_discord(tweet):
 
 
 # ============================================================
-# メイン処理
+# メイン
 # ============================================================
 
 def main():
 
-    print("=" * 40)
-    print("X → Discord 通知BOT")
-    print("=" * 40)
+    print("=" * 50)
+    print("星の翼 X → Discord 通知BOT")
+    print("=" * 50)
 
     if not DISCORD_WEBHOOK:
 
@@ -846,49 +1091,64 @@ def main():
         return 1
 
     # --------------------------------------------------------
-    # X取得
+    # 取得方法1
     # --------------------------------------------------------
 
-    try:
-
-        next_data = fetch_timeline()
-
-    except Exception as e:
-
-        print(
-            "Xタイムライン取得エラー"
-        )
-
-        print(
-            f"詳細: {e}"
-        )
-
-        return 1
+    tweets = fetch_syndication()
 
     # --------------------------------------------------------
-    # 投稿抽出
+    # 取得方法1が429などで失敗した場合
+    # 取得方法2を使用
     # --------------------------------------------------------
-
-    tweets = find_tweets(
-        next_data
-    )
 
     if not tweets:
 
+        print("")
         print(
-            "投稿を取得できませんでした。"
+            "Syndicationから投稿を取得できませんでした。"
+        )
+
+        print(
+            "バックアップ取得先へ切り替えます。"
+        )
+
+        tweets = fetch_fxtwitter_media()
+
+    # --------------------------------------------------------
+    # どちらも失敗
+    # --------------------------------------------------------
+
+    if not tweets:
+
+        print("")
+        print(
+            "ERROR: X投稿を取得できませんでした。"
+        )
+
+        print(
+            "今回はlast_seen.txtを変更しません。"
         )
 
         return 1
 
-    latest_tweet = tweets[0]
+    # --------------------------------------------------------
+    # 最新投稿
+    # --------------------------------------------------------
 
+    latest = tweets[0]
+
+    print("")
     print(
-        f"最新投稿ID: {latest_tweet['id']}"
+        f"取得投稿数: {len(tweets)}"
     )
 
     print(
-        f"最新投稿: {latest_tweet['text'][:100]}"
+        f"最新投稿ID: {latest['id']}"
+    )
+
+    print(
+        f"最新投稿本文: "
+        f"{latest['text'][:100]}"
     )
 
     # --------------------------------------------------------
@@ -899,20 +1159,17 @@ def main():
 
     if not last_seen:
 
+        print("")
         print(
             "初回実行です。"
         )
 
-        print(
-            "現在の最新投稿を基準点として保存します。"
-        )
-
         save_last_seen(
-            latest_tweet["id"]
+            latest["id"]
         )
 
         print(
-            "初回実行では通知を送信しません。"
+            "初回実行ではDiscord通知しません。"
         )
 
         return 0
@@ -922,36 +1179,53 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 新着投稿抽出
+    # 新着投稿
     # --------------------------------------------------------
+
+    last_seen_int = int(
+        last_seen
+    )
 
     new_tweets = []
 
-    last_seen_int = int(last_seen)
-
     for tweet in tweets:
 
-        tweet_id_int = int(
-            tweet["id"]
-        )
+        try:
 
-        if tweet_id_int > last_seen_int:
+            tweet_id = int(
+                tweet["id"]
+            )
 
-            new_tweets.append(tweet)
+        except Exception:
 
-    # 古い順に通知する
+            continue
+
+        if tweet_id > last_seen_int:
+
+            new_tweets.append(
+                tweet
+            )
+
     new_tweets.sort(
-        key=lambda x: int(x["id"])
+        key=lambda x: int(
+            x["id"]
+        )
     )
+
+    # --------------------------------------------------------
+    # 新着なし
+    # --------------------------------------------------------
 
     if not new_tweets:
 
+        print("")
         print(
             "新着投稿はありません。"
         )
 
         return 0
 
+    print("")
     print(
         f"新着投稿: {len(new_tweets)}件"
     )
@@ -964,24 +1238,67 @@ def main():
 
     for tweet in new_tweets:
 
-        print("-" * 40)
+        print("")
+        print("-" * 50)
 
         print(
-            f"通知対象: {tweet['id']}"
+            f"通知対象ID: {tweet['id']}"
         )
 
         print(
-            tweet["text"][:200]
+            f"本文: {tweet['text'][:200]}"
         )
+
+        # バックアップ取得で本文しか取れていない場合、
+        # 個別投稿APIで画像などを補完
+        if not tweet.get(
+            "media_urls"
+        ):
+
+            detail = fetch_single_tweet(
+                tweet["id"]
+            )
+
+            if detail:
+
+                if detail.get(
+                    "text"
+                ):
+
+                    tweet["text"] = (
+                        detail["text"]
+                    )
+
+                if detail.get(
+                    "media_urls"
+                ):
+
+                    tweet[
+                        "media_urls"
+                    ] = detail[
+                        "media_urls"
+                    ]
+
+                if detail.get(
+                    "permalink"
+                ):
+
+                    tweet[
+                        "permalink"
+                    ] = detail[
+                        "permalink"
+                    ]
 
         try:
 
-            send_discord(tweet)
+            send_discord(
+                tweet
+            )
 
-            # Discord送信成功後だけ更新
-            last_success_id = tweet["id"]
+            last_success_id = (
+                tweet["id"]
+            )
 
-            # 連続通知を少しだけ間隔を空ける
             time.sleep(1)
 
         except Exception as e:
@@ -994,36 +1311,43 @@ def main():
                 f"詳細: {e}"
             )
 
-            # 途中で失敗した場合、
-            # 成功したところまでをlast_seenにする
             break
 
     # --------------------------------------------------------
-    # 状態保存
+    # last_seen更新
     # --------------------------------------------------------
 
-    if last_success_id != last_seen:
+    if (
+        last_success_id
+        != last_seen
+    ):
 
         save_last_seen(
             last_success_id
         )
 
-    # すべて成功したか確認
-    if last_success_id == new_tweets[-1]["id"]:
+    # --------------------------------------------------------
+    # 完了判定
+    # --------------------------------------------------------
 
+    if (
+        last_success_id
+        == new_tweets[-1]["id"]
+    ):
+
+        print("")
         print(
-            "すべての新着投稿の処理が完了しました。"
+            "すべての処理が完了しました。"
         )
 
         return 0
 
-    else:
+    print("")
+    print(
+        "一部の投稿が未処理です。"
+    )
 
-        print(
-            "一部の投稿が未処理です。"
-        )
-
-        return 1
+    return 1
 
 
 # ============================================================
@@ -1034,7 +1358,7 @@ if __name__ == "__main__":
 
     try:
 
-        exit_code = main()
+        result = main()
 
     except KeyboardInterrupt:
 
@@ -1042,7 +1366,7 @@ if __name__ == "__main__":
             "処理を中断しました。"
         )
 
-        exit_code = 1
+        result = 1
 
     except Exception as e:
 
@@ -1054,6 +1378,8 @@ if __name__ == "__main__":
             f"詳細: {e}"
         )
 
-        exit_code = 1
+        result = 1
 
-    raise SystemExit(exit_code)
+    raise SystemExit(
+        result
+    )
